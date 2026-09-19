@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The release workflow also builds `iroh_tunnel-<tag>-linux-aarch64.zip`
+  (on GitHub's arm64 Linux runner), for Raspberry Pis, Graviton hosts and
+  Apple-silicon VMs.
+- CI: the interop harness is a required job now, after staying green on
+  every run since the split; it was advisory while the runner's UDP and
+  relay reach were unproven.
+
 ## v0.2.0 — 2026-09-19
 
 The API round the terminal player asked for, and releases.

@@ -8,11 +8,19 @@
 #   iroh_tunnel-<tag>-macos.xcframework.zip    iroh_tunnel.xcframework (arm64)
 #   iroh_tunnel-<tag>-windows-x86_64.zip       iroh_tunnel.dll + iroh-tunnel-client.exe
 #   iroh_tunnel-<tag>-linux-x86_64.zip         libiroh_tunnel.so + iroh-tunnel-client
+#   iroh_tunnel-<tag>-linux-aarch64.zip        the same for arm64 Linux (Raspberry Pi, Graviton, Apple-silicon VMs)
 #   iroh-tunnel-client-<tag>-macos-arm64.zip   the dev client for macOS
 #   mstream_iroh.h                             the C header (cbindgen, checked against the committed one)
 #   SHA256SUMS                                 one line per asset above
 #   SWIFTPM-CHECKSUMS.txt                      `swift package compute-checksum` of the two xcframework zips,
 #                                              for a remote `binaryTarget(url:checksum:)`
+#
+# The crates.io publish rides the same tag once the repository variable
+# CRATES_IO_TRUSTED_PUBLISHING is "true": crates.io mints a short-lived token
+# for this workflow over GitHub OIDC (rust-lang/crates-io-auth-action), so no
+# long-lived token is stored here. The first version of a crate has to be
+# published by hand (`cargo publish`) before a trusted publisher can be
+# configured for it at crates.io/crates/mstream-iroh-tunnel/settings.
 #
 # The xcframeworks are ad-hoc signed, as the build scripts always did: Xcode
 # re-signs with the app's identity when it embeds them.
@@ -128,8 +136,16 @@ jobs:
           path: out/*
 
   linux:
-    name: Linux (.so) and the header
-    runs-on: ubuntu-latest
+    name: Linux ${{ matrix.arch }} (.so)${{ matrix.header && ' and the header' || '' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The header is generated once; it does not depend on the
+          # architecture, and CI checks it on every push anyway.
+          - { arch: x86_64, runner: ubuntu-latest, header: true }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, header: false }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -142,6 +158,7 @@ jobs:
         # A tag from before the header existed (v0.1.0) has no cbindgen
         # config and ships without a header; a tag that has one must match
         # the committed header exactly.
+        if: matrix.header
         run: |
           set -euo pipefail
           if [ ! -f cbindgen.toml ]; then
@@ -157,12 +174,12 @@ jobs:
           set -euo pipefail
           tag="${{ inputs.tag || github.ref_name }}"
           mkdir -p out
-          (cd target/release && zip -q "../../out/iroh_tunnel-$tag-linux-x86_64.zip" libiroh_tunnel.so iroh-tunnel-client)
-          [ -f include/mstream_iroh.h ] && cp include/mstream_iroh.h out/ || true
+          (cd target/release && zip -q "../../out/iroh_tunnel-$tag-linux-${{ matrix.arch }}.zip" libiroh_tunnel.so iroh-tunnel-client)
+          if ${{ matrix.header }} && [ -f include/mstream_iroh.h ]; then cp include/mstream_iroh.h out/; fi
           ls -l out
       - uses: actions/upload-artifact@v4
         with:
-          name: linux
+          name: linux-${{ matrix.arch }}
           path: out/*
 
   release:
@@ -201,3 +218,29 @@ jobs:
           body_path: notes.md
           files: assets/*
           fail_on_unmatched_files: true
+
+  crates-io:
+    name: Publish to crates.io
+    needs: release
+    if: vars.CRATES_IO_TRUSTED_PUBLISHING == 'true'
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The tag names the manifest's version
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          [ "$tag" = "v$version" ] || { echo "::error::tag $tag but Cargo.toml says $version"; exit 1; }
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
