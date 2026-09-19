@@ -1,12 +1,22 @@
 [package]
-name = "iroh_tunnel"
+name = "mstream-iroh-tunnel"
 version = "0.1.0"
 edition = "2021"
-description = "mStream iroh remote-access tunnel client (port of scripts/mstream-iroh-client.mjs, PR #643)"
+description = "mStream remote-access tunnel client: dials a server's iroh endpoint from a Quick Connect pairing code or a federation guest ticket and exposes it as a local HTTP origin. Rust library plus a C ABI for other languages."
 license = "MIT"
+repository = "https://github.com/IrosTheBeggar/mstream-iroh-tunnel"
+homepage = "https://mstream.io/"
+readme = "README.md"
+keywords = ["mstream", "iroh", "tunnel", "quic", "p2p"]
+categories = ["network-programming"]
 
 [lib]
-# cdylib → Android .so (consumed via flutter_rust_bridge); rlib → the dev bin + tests.
+# The library keeps its historical name so the shipped artifacts (libiroh_tunnel.so,
+# iroh_tunnel.xcframework, iroh_tunnel.dll) and the C symbols (mstream_iroh_*) do not
+# change for the consumers that load them by name.
+name = "iroh_tunnel"
+# cdylib → the per-platform binaries (Android .so, Apple xcframeworks, Windows .dll);
+# rlib → Rust consumers (mstream-terminal-player), the dev bin and the tests.
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Build libiroh_tunnel.so for the app's ABIs and stage it into the Flutter app's
-# jniLibs so `flutter build apk --flavor <full|play>` packages it.
+# Build libiroh_tunnel.so for Android (arm64-v8a + x86_64, API 26) and stage it
+# under dist/android/<abi>/ — or under $IROH_TUNNEL_DEST/<abi>/, so a consumer
+# can point this straight at its own tree (the mStream mobile app:
+#   IROH_TUNNEL_DEST=../mstream_music/android/app/src/main/jniLibs ./build-android.sh).
 #
-# The staged .so is COMMITTED to git (android/app/src/main/jniLibs/<abi>/), same as
-# libprojectM-4.so — the release CI (ubuntu-latest) has no Rust/NDK toolchain, so it
-# ships the committed binary. RULE: after changing anything under rust/iroh_tunnel/,
-# re-run this script and commit the updated .so. (release.yml fails the build if the
-# .so is missing from the artifacts, but it can't detect a stale one.)
+# Consumers that ship the binary commit it on their side (the mobile app's
+# release CI has no Rust/NDK toolchain, so it packages the committed .so) or
+# take it from a tagged release's assets. Their rule: after a bump, re-stage
+# and re-commit — a stale binary is the one failure packaging checks cannot see.
 #
 # Prereqs (one-time):
 #   rustup target add aarch64-linux-android x86_64-linux-android
@@ -19,9 +20,9 @@ cd "$(dirname "$0")"
 
 : "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to your NDK, e.g. .../Android/Sdk/ndk/28.2.13676358}"
 
-JNILIBS="../../android/app/src/main/jniLibs"
+DEST="${IROH_TUNNEL_DEST:-dist/android}"
 
-# --platform 26 matches the app's minSdk. The flag is --platform (NOT -p, which
+# --platform 26 matches the mobile app's minSdk. The flag is --platform (NOT -p, which
 # cargo passes through to cargo as --package).
 cargo ndk -t arm64-v8a -t x86_64 --platform 26 build --release --lib
 
@@ -30,10 +31,9 @@ cargo ndk -t arm64-v8a -t x86_64 --platform 26 build --release --lib
 # already statically links — dead weight in the APK.
 for pair in "arm64-v8a:aarch64-linux-android" "x86_64:x86_64-linux-android"; do
   abi="${pair%%:*}"; triple="${pair##*:}"
-  mkdir -p "$JNILIBS/$abi"
-  cp "target/$triple/release/libiroh_tunnel.so" "$JNILIBS/$abi/libiroh_tunnel.so"
+  mkdir -p "$DEST/$abi"
+  cp "target/$triple/release/libiroh_tunnel.so" "$DEST/$abi/libiroh_tunnel.so"
 done
 
 echo "staged:"
-ls -lh "$JNILIBS"/*/libiroh_tunnel.so
-echo "remember: commit the updated .so — release builds ship the committed binary."
+ls -lh "$DEST"/*/libiroh_tunnel.so

@@ -1,18 +1,29 @@
-# iroh_tunnel — mStream remote-access tunnel client (Phase 2B / M1)
+# mstream-iroh-tunnel
 
-Native client for mStream's iroh remote-access tunnel ([mStream PR #643](https://github.com/IrosTheBeggar/mStream/pull/643)). It dials the server by its iroh EndpointId, completes the shared-secret handshake, and exposes the server as a **plain local HTTP origin** (`http://127.0.0.1:<port>`) that the Flutter app uses as its base URL — so the rest of the app is unchanged. See `../../IROH_TRANSPORT_PLAN.md` for the full plan.
+The client side of mStream's iroh remote-access tunnel, as a Rust library and
+a C ABI. Given a **Quick Connect pairing code** (`mstr1:…`, from a server's
+admin panel) or a **federation guest ticket** (`mstrfedg1:…`, handed to a
+device by its own server for one of that server's federated peers), it dials
+the server's iroh endpoint, completes the handshake, and exposes the server as
+a **plain local HTTP origin** — `http://127.0.0.1:<port>` — so an ordinary HTTP
+client, range requests and all, works against it unchanged. mStream's own
+auth still gates the API inside the tunnel.
 
-This is a faithful Rust port of the server's reference client `scripts/mstream-iroh-client.mjs`.
+One implementation, three consumers:
 
-## Status (M1)
+| Consumer | How |
+|---|---|
+| [mstream_music](https://github.com/IrosTheBeggar/mstream_music) — the Flutter app (Android, iOS, macOS, Windows) | the C ABI (`mstream_iroh_*`, [src/c_api.rs](src/c_api.rs)) through `dart:ffi`, loading the per-platform binary the `build-*.sh` scripts produce |
+| [mstream-terminal-player](https://github.com/IrosTheBeggar/mstream-terminal-player) — Rust | the crate as a Cargo dependency (`connect_tunnel`, `Tunnel`) |
+| anything else | either of the above; `iroh-tunnel-client` ([src/bin/client.rs](src/bin/client.rs)) is the reference: dial a code, get a local port |
 
-- ✅ Rust core (`connect_tunnel`) implementing the full frozen wire contract.
-- ✅ **Interop proven on desktop** against a replica of the PR #643 server: JSON request, **HTTP Range/seek (206, byte-correct)**, and concurrent requests all tunnel correctly.
-- ✅ C ABI + Dart FFI binding; cross-compiles for `arm64-v8a` + `x86_64` at Android API 26.
-- ✅ **Self-healing in place (Phase 2, 2026-09):** the reconnect supervisor's backoff is cut short by an app kick or by the home relay coming back (`wait_backoff`); `mstream_iroh_force_reconnect` re-binds the loopback listener on the SAME port and closes the current connection so the supervisor re-dials at once (iOS kills the listener during a suspension while QUIC survives); bridges wait up to 10 s for a swapped-in connection; a native events ring (`mstream_iroh_drain_events`) and the home-relay state (`mstream_iroh_relay_online`) feed the app's diagnostics + watchdog. The harness's KICK phase covers it.
-- ✅ **Keyed tunnels + federation guest mode (ABI v2, 2026-09):** the native table holds tunnels by an app-chosen key (`mstream_iroh_start(key, code, port)` and every per-tunnel call takes the key; `mstream_iroh_network_changed` fans out), so a Quick Connect server and a directly-reached federated peer can run side by side, each on its own loopback port with its own supervisor. A `mstrfedg1:{t,g}` **guest ticket** (mStream `docs/federation-guest-ticket.md`) dials the peer's federation endpoint (ALPN `mstream/federation/1`) and presents the guest token on the first bi-stream instead of a secret. `mstream_iroh_set_credential(key, code)` swaps a running tunnel's credential **in place** — the daily guest-token refresh must not rotate the loopback port — and a tunnel whose supervisor gave up on a rejected handshake re-dials at once with the new one. `mstream_iroh_abi_version` (2) lets the Dart side refuse a stale binary. The harness's GUEST phase covers the dial, the rejection, and the swap.
-- ✅ **iroh 1.1.0 (2026-09):** lockfile-only update (`iroh = "1"` unchanged) — iroh/base/dns/relay 1.1.0, noq 1.2.0, netdev 0.46.2; clears the four `cargo audit` advisories of the 1.0.0 lock and ships the dalek crypto crates as releases instead of RCs. netdev 0.46 dropped the iOS 18-only `nw_path_is_ultra_constrained` call, so the `apple_compat.rs` launch-crash shim is gone and `build-ios.sh` now fails if that import ever returns. Binaries rebuilt (table below); harness ALL PASS against `@number0/iroh` 1.1.0.
-- ⏳ **Pending (device loop):** stage the `.so` into `jniLibs`, build the APK, and confirm on a physical device against a live server (see *On-device acceptance* below).
+It is a faithful port of the server's reference client
+(`scripts/mstream-iroh-client.mjs` in the
+[mStream](https://github.com/IrosTheBeggar/mStream) repo, PR #643), and it
+moved here from `rust/iroh_tunnel` in the mobile app's repository on
+2026-09-18, history included. The wire specs stay in the mStream repo:
+`docs/iroh-pairing-code.md`, `docs/federation-guest-ticket.md` and
+`docs/federation-ticket.md`.
 
 ## Frozen wire contract (must match the server byte-for-byte)
 
@@ -23,22 +34,57 @@ This is a faithful Rust port of the server's reference client `scripts/mstream-i
 - **Guest mode** (mStream federation, `docs/federation-guest-ticket.md` there): a `mstrfedg<V>:<base64url(JSON{ t: <EndpointTicket>, g: <guest JWT> })>` ticket dials ALPN `mstream/federation/1` and writes the token bytes (≤ 2 KB, the peer's `HANDSHAKE_LIMIT`) on the first bi-stream; `"OK"`/`"NO"` as above, where `"NO"` means the token expired or its key was revoked → refresh it from the parent (`set_credential`), no re-pair. A `mstrfed<V>:` federation ticket (admin-to-admin, carries a standing key) is refused by name.
 - Then **one bi-stream per inbound local TCP connection**; raw byte pipe both ways (one bi-stream == one TCP connection → full HTTP semantics, incl. range/seek). Clean EOF → `finish`/`shutdown`; either side erroring → `reset`/`stop` the partner.
 
-## Layout
+## What the client does beyond the wire
 
-| Path | Role |
-|---|---|
-| `src/lib.rs` | async core: pairing parse, connect, handshake, the byte-pump bridge. |
-| `src/ffi.rs` | owned global Tokio runtime + the tunnel table keyed by the app's id: `tunnel_start(key, code, port)`, `tunnel_stop(key)`, `tunnel_set_credential(key, code)`, … (dart:ffi has no ambient runtime, so we `block_on`). |
-| `src/c_api.rs` | `#[no_mangle]` C ABI (`mstream_iroh_*`) consumed by `dart:ffi`. |
-| `src/bin/client.rs` | dev CLI; drives the same `ffi` path the app uses. |
-| `interop/harness.mjs` | stands up the PR #643 server side and drives the compiled Rust client through real HTTP. |
-| `build-android.sh` | cross-compiles + stages the `.so` into the app's `jniLibs`. |
+- **Keyed tunnels.** The `ffi` table holds tunnels by an app-chosen key, so a
+  Quick Connect server and a directly reached federated peer run side by
+  side, each on its own loopback port with its own supervisor.
+- **A reconnect supervisor.** Exponential backoff, cut short by an app kick
+  (`force_reconnect`) or by the home relay coming back; `force_reconnect`
+  re-binds the loopback listener on the **same** port and closes the current
+  connection so the supervisor re-dials at once (iOS kills the listener
+  during a suspension while QUIC survives); bridges wait up to 10 s for a
+  swapped-in connection.
+- **In-place credential swap** (`set_credential`). A guest token is renewed
+  daily and the renewal must not rotate the loopback port; a supervisor that
+  gave up on a rejected handshake re-dials at once with the new credential.
+- **Loopback auth.** Each tunnel has a random token that every local request
+  must carry as `__lt=<token>` in its request line, so other processes on
+  the device cannot use the proxy.
+- **Status** (`connecting / connected / reconnecting / rejected / down`),
+  **path kind** (direct or relay), the home-relay state, and an events ring
+  for a diagnostics log.
+- **ABI version 2** (`mstream_iroh_abi_version`): a binding refuses an older
+  binary, whose `start` took different arguments.
 
-Dart side: `../../lib/native/iroh_tunnel.dart` (FFI wrapper; `IrohTunnel.instance.start(code)` → port).
+## Use it from Rust
 
-## Binding choice: C ABI + `dart:ffi` (not flutter_rust_bridge)
+```toml
+[dependencies]
+mstream-iroh-tunnel = { git = "https://github.com/IrosTheBeggar/mstream-iroh-tunnel", tag = "v0.1.0" }
+```
 
-The surface is small (abi-version, start / stop / status / path-kind / network-changed / local-token / last-error, force-reconnect / drain-events / relay-online, set-credential, string-free — 14 symbols), so a hand-written C ABI consumed via `dart:ffi` is lighter than an frb codegen step in the build/CI — one `.so` plus a small Dart wrapper. frb remains an option if a richer or streaming surface is ever needed. The Dart side probes `mstream_iroh_abi_version` first and reports the tunnel as unsupported (with the reason in `IrohTunnel.unsupportedReason`) against a binary older than ABI v2, whose `start` takes different arguments — refusing beats misreading.
+```rust
+let tunnel = iroh_tunnel::connect_tunnel(code, 0).await?; // 0 = an ephemeral port
+let base = format!("http://127.0.0.1:{}", tunnel.local_port);
+let lt = tunnel.local_token(); // append ?__lt=<lt> to every request
+```
+
+The library keeps its historical name, `iroh_tunnel`, so that the shipped
+artifacts and the C symbols never changed — hence the `iroh_tunnel::` path.
+`Tunnel::set_credential`, `force_reconnect`, `nudge_network` and
+`begin_shutdown` take a `&tokio::runtime::Runtime`; the `ffi` module owns one
+for bindings that have no ambient runtime.
+
+## Use it from another language
+
+Build a binary (below) and call the C ABI — 14 symbols, declared in
+[src/c_api.rs](src/c_api.rs): `mstream_iroh_abi_version`,
+`mstream_iroh_start(key, code, port)` → the loopback port, `mstream_iroh_stop`,
+`_is_active`, `_status`, `_path_kind`, `_network_changed`, `_force_reconnect`,
+`_set_credential`, `_drain_events`, `_relay_online`, `_local_token`,
+`_last_error`, `_string_free`. The mobile app's binding
+(`lib/native/iroh_tunnel.dart` in its repo) is the worked example.
 
 ## Run the interop test (desktop, no device needed)
 
@@ -48,37 +94,77 @@ cd .. && cargo build               # builds the dev client binary
 node interop/harness.mjs           # Rust client ⇆ JS server; asserts JSON + Range + concurrency + reconnect + in-place kick + a spent kick not cutting the next backoff + guest mode (federation ALPN, rejected token, in-place credential swap)
 ```
 
-## Build for Android
+`interop/pairing-server.mjs` is the server half on its own, kept alive for
+manual testing of a client build: it prints a pairing code to paste in.
 
-```sh
-rustup target add aarch64-linux-android x86_64-linux-android
-cargo install cargo-ndk
-export ANDROID_NDK_HOME=.../Android/Sdk/ndk/28.2.13676358
-./build-android.sh                 # stages libiroh_tunnel.so into ../../android/app/src/main/jniLibs/<abi>/
-```
+## Build the binaries
 
-Real shipped `.so` (release, `opt-level=z` + thin-LTO + stripped, API 26). The
-binary is **committed** to `jniLibs` (the CI release runner has no Rust/NDK), so
-these checksums let a reviewer/user verify the shipped artifact — **rebuild via
-`./build-android.sh` and update this table whenever `src/` changes** (CI fails a
-release if the `.so` is missing, but cannot detect a stale one):
+Every script stages into `dist/<platform>/` by default, or into
+`$IROH_TUNNEL_DEST` when that is set — a consumer's own tree, for example
+the mobile app's `jniLibs` folder. Release builds are size-optimized
+(`opt-level = "z"`, thin LTO, stripped; see `[profile.release]`) — rustc
+strips cdylibs with `strip -x`, which keeps the exported C symbols.
 
-| ABI | size | sha256 |
-|---|---|---|
-| arm64-v8a | **10.09 MB** (10,093,952 bytes) | `f1ffbdae155052e589eecdef6f13932152bc84d9a83220cd2406a99dadc60cf2` |
-| x86_64 | 11.68 MB (11,678,560 bytes) — emulators only | `18c682ae31d7ef52f9e3b42c48894e2dfe898f23c7170a1f289206832ab4db45` |
+- **Android** — `rustup target add aarch64-linux-android x86_64-linux-android`,
+  `cargo install cargo-ndk`, `export ANDROID_NDK_HOME=…`; then
+  `./build-android.sh` → `dist/android/{arm64-v8a,x86_64}/libiroh_tunnel.so`
+  (API 26, ~10 MB each: iroh core only, no blobs/docs/gossip/rpc).
+- **iOS** — `rustup target add aarch64-apple-ios aarch64-apple-ios-sim` and
+  the Xcode command line tools; `./build-ios.sh` →
+  `dist/ios/iroh_tunnel.xcframework` (device + simulator arm64, minos 15.0).
+  The script fails if all 14 symbols are not exported from both slices, or if
+  the iOS 18-only `nw_path_is_ultra_constrained` import ever returns (it
+  crashed the app at launch on iOS 15–17 once).
+- **macOS** — `./build-macos.sh` → `dist/macos/iroh_tunnel.xcframework`
+  (arm64, minos 11.0).
+- **Windows / Linux** — a host `cargo build --release --lib` →
+  `target/release/iroh_tunnel.dll` or `libiroh_tunnel.so`. The Android-only
+  dependencies are `cfg`-gated; nothing else is platform-specific.
 
-With Play app-bundle ABI splits, an arm64 device downloads only its own slice (~9.5 MB). iroh **core only** — no blobs/docs/gossip/rpc (the full off-the-shelf FFI is 31 MB).
+Consumers that ship a binary commit it on their side (the mobile app's
+release CI has no Rust toolchain); a stale committed binary is the one
+failure their packaging checks cannot detect, so a bump here means re-staging
+and re-committing there. Tag-driven release assets with checksums are on the
+roadmap, so that step becomes a download.
 
-The release **sideload APK is universal** (both ABIs) on purpose — it runs on arm64
-phones and x86_64 emulators from one artifact. For a smaller arm64-only sideload
-build use `flutter build apk --flavor full --split-per-abi --target-platform android-arm64,android-x64`
-(the Play AAB always splits per device).
+## Layout
 
-## On-device acceptance (the remaining M1 step)
+| Path | Role |
+|---|---|
+| `src/lib.rs` | async core: credential parse, connect, handshake, the byte-pump bridge, the supervisor. |
+| `src/ffi.rs` | owned global Tokio runtime + the tunnel table keyed by the app's id: `tunnel_start(key, code, port)`, `tunnel_stop(key)`, `tunnel_set_credential(key, code)`, … (a `dart:ffi` caller has no ambient runtime, so it `block_on`s). |
+| `src/c_api.rs` | `#[no_mangle]` C ABI (`mstream_iroh_*`). |
+| `src/android_init.rs` | Android only: registers the JavaVM + app Context with `ndk_context` (iroh's network monitoring needs it). |
+| `src/bin/client.rs` | dev CLI; drives the same `ffi` path the app uses. |
+| `interop/harness.mjs` | stands up the server side on `@number0/iroh` and drives the compiled Rust client through real HTTP. |
+| `interop/pairing-server.mjs` | the server side alone, for manual client testing. |
+| `build-android.sh`, `build-ios.sh`, `build-macos.sh` | cross-compile and stage the binaries. |
 
-1. Run a real mStream with PR #643, set `iroh.enabled`, copy the pairing code from the admin **Remote Access** panel.
-2. `./build-android.sh` to stage the `.so`, then `flutter build apk --flavor full` (or `play`).
-3. From a throwaway call: `final port = await IrohTunnel.instance.start('<code>');` then GET `http://127.0.0.1:$port/api/` → expect 200.
+## Binding choice: C ABI + `dart:ffi` (not flutter_rust_bridge)
 
-(M2 wires this into the `Server` model + QR-scan add-server UI; M3 adds lifecycle/hardening.)
+The surface is small (abi-version, start / stop / status / path-kind / network-changed / local-token / last-error, force-reconnect / drain-events / relay-online, set-credential, string-free — 14 symbols), so a hand-written C ABI consumed via `dart:ffi` is lighter than a codegen step in the build — one binary plus a small wrapper on the other side. A generated binding remains an option if a richer or streaming surface is ever needed. The Dart side probes `mstream_iroh_abi_version` first and reports the tunnel as unsupported (with the reason in `IrohTunnel.unsupportedReason`) against a binary older than ABI v2, whose `start` takes different arguments — refusing beats misreading.
+
+## Roadmap
+
+- A tag-driven release workflow: per-platform binaries, `SHA256SUMS`, a
+  generated C header.
+- Cargo features `c-abi` (default; off for Rust consumers so no
+  `#[no_mangle]` symbols land in their binaries) and `os-trust` (iroh's
+  `platform-verifier`, for hosts behind a corporate trust store).
+- Typed dial errors (rejected, unreachable, bad code) instead of matching the
+  error text; a staged connect (bind, relay, dial, handshake) so a diagnostic
+  can say which stage died; `mstream_iroh_version()`.
+- crates.io.
+
+The consumers' migration plan lives in the mobile app repo
+(`IROH_TUNNEL_CRATE_PLAN.md`).
+
+## History
+
+- **2026-06** — the Android client shim (M1) for mStream PR #643; interop
+  proven on desktop against a replica of the server.
+- **2026-09** — self-healing in place (the kick, the same-port re-bind, the
+  events ring); keyed tunnels and federation guest mode (ABI v2); iroh 1.1.0
+  (a lockfile update that cleared four `cargo audit` advisories).
+- **2026-09-18** — split out of `mstream_music/rust/iroh_tunnel` as this
+  repository.

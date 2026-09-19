@@ -1,0 +1,57 @@
+# Every push and pull request: the unit tests, clippy and a build of the
+# library plus the dev client on the three desktop hosts; then the interop
+# harness — the Rust client against a replica of the mStream server's iroh
+# endpoint (interop/harness.mjs, on @number0/iroh). The harness needs UDP and
+# an iroh relay from the runner, so it is advisory until it has been green
+# for a while; the per-platform release binaries are a separate, tag-driven
+# workflow (not written yet — see the README's roadmap).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Build the library and the dev client
+        run: cargo build --locked --lib --bin iroh-tunnel-client
+
+  interop:
+    name: Interop harness (Rust client ⇆ JS server)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the dev client (the harness spawns target/debug/iroh-tunnel-client)
+        run: cargo build --locked --bin iroh-tunnel-client
+      - name: Install the JS server side
+        run: npm install
+        working-directory: interop
+      - name: Run the harness
+        run: node interop/harness.mjs
+        timeout-minutes: 15

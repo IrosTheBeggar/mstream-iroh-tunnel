@@ -1526,21 +1526,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iroh_tunnel"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "getrandom 0.2.17",
- "iroh",
- "iroh-tickets",
- "jni 0.21.1",
- "ndk-context",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1739,6 +1724,21 @@ dependencies = [
  "smallvec",
  "tagptr",
  "uuid",
+]
+
+[[package]]
+name = "mstream-iroh-tunnel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "getrandom 0.2.17",
+ "iroh",
+ "iroh-tickets",
+ "jni 0.21.1",
+ "ndk-context",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

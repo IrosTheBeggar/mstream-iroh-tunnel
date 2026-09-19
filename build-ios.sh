@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Build iroh_tunnel.xcframework (device arm64 + simulator arm64) and stage it
-# into the iroh_tunnel_native plugin, where Flutter's SwiftPM support links it
-# into Runner and embeds + signs it automatically.
+# under dist/ios/ — or under $IROH_TUNNEL_DEST, so a consumer can point this
+# straight at its own tree (the mStream mobile app vends it to Runner through
+# its iroh_tunnel_native SwiftPM package:
+#   IROH_TUNNEL_DEST=../mstream_music/packages/iroh_tunnel_native/ios/iroh_tunnel_native/Frameworks ./build-ios.sh).
 #
-# The xcframework is COMMITTED to git (same model as the Android jniLibs .so —
-# release CI has no Rust toolchain and ships the committed binary).
-# RULE: after changing rust/iroh_tunnel/, re-run this script and commit the
-# updated xcframework, exactly like build-android.sh.
+# Consumers that ship the binary commit it on their side (their release CI has
+# no Rust toolchain) or take it from a tagged release's assets; after a bump
+# they re-stage and re-commit, exactly as for build-android.sh.
 #
 # Prereqs (one-time):
 #   rustup target add aarch64-apple-ios aarch64-apple-ios-sim
@@ -28,7 +29,7 @@ unset SDKROOT
 
 FW=iroh_tunnel
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-DEST="../../packages/iroh_tunnel_native/ios/iroh_tunnel_native/Frameworks"
+DEST="${IROH_TUNNEL_DEST:-dist/ios}"
 STAGE="target/ios-stage" # under target/ -> already gitignored
 
 # --lib skips the iroh-tunnel-client dev bin. The release profile in
@@ -103,4 +104,3 @@ for slice in ios-arm64 ios-arm64-simulator; do
   fi
 done
 echo "staged: $DEST/$FW.xcframework"
-echo "remember: commit the updated xcframework — builds ship the committed binary."

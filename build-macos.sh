@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# Build iroh_tunnel.xcframework for macOS (arm64) and stage it into the
-# iroh_tunnel_native plugin's macos/ side, where Flutter's SwiftPM support
-# links it into Runner and embeds + signs it automatically.
-#
-# Same model as build-ios.sh (and viz_decoder's build-macos.sh): the
-# xcframework is COMMITTED to git — release CI has no Rust toolchain. RULE:
-# after changing rust/iroh_tunnel/, re-run this script and commit the result.
+# Build iroh_tunnel.xcframework for macOS (arm64) and stage it under
+# dist/macos/ — or under $IROH_TUNNEL_DEST, so a consumer can point this
+# straight at its own tree (the mStream mobile app's macos/ side of its
+# iroh_tunnel_native SwiftPM package). Same model as build-ios.sh: consumers
+# that ship the binary commit it on their side or take a release asset.
 #
 # Prereqs: host Rust toolchain + Xcode command line tools. Apple-silicon only.
 set -euo pipefail
@@ -16,7 +14,7 @@ unset SDKROOT
 
 FW=iroh_tunnel
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-DEST="../../packages/iroh_tunnel_native/macos/iroh_tunnel_native/Frameworks"
+DEST="${IROH_TUNNEL_DEST:-dist/macos}"
 STAGE="target/macos-stage"
 
 cargo build --release --lib --target aarch64-apple-darwin
@@ -56,9 +54,8 @@ xcodebuild -create-xcframework \
   -framework "$fwdir" \
   -output "$DEST/$FW.xcframework"
 
-# The C ABI v2 export set (rust/iroh_tunnel/src/c_api.rs) — keep in step
+# The C ABI v2 export set (src/c_api.rs) — keep in step
 # with build-ios.sh.
 n=$(xcrun dyld_info -exports "$DEST/$FW.xcframework/macos-arm64/$FW.framework/$FW" | grep -c ' _mstream_iroh_')
 [ "$n" -eq 14 ] || { echo "ERROR: exports $n/14 mstream_iroh_ symbols"; exit 1; }
 echo "staged: $DEST/$FW.xcframework"
-echo "remember: commit the updated xcframework — builds ship the committed binary."

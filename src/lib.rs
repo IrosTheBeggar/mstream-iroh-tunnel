@@ -413,6 +413,7 @@ impl Tunnel {
     ///     with the new one, see [`supervise`]);
     ///   - REJECTED (the supervisor gave up): a fresh supervisor is spawned
     ///     and re-dials at once — the listener never left the port.
+    ///
     /// Non-blocking: parsing is pure and the re-dial runs on `rt`.
     pub fn set_credential(&self, code: &str, rt: &tokio::runtime::Runtime) -> Result<()> {
         let pairing = parse_pairing_code(code)?;
