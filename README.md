@@ -61,14 +61,29 @@ moved here from `rust/iroh_tunnel` in the mobile app's repository on
 
 ```toml
 [dependencies]
-mstream-iroh-tunnel = { git = "https://github.com/IrosTheBeggar/mstream-iroh-tunnel", tag = "v0.1.0" }
+mstream-iroh-tunnel = { git = "https://github.com/IrosTheBeggar/mstream-iroh-tunnel", tag = "v0.2.0", default-features = false, features = ["os-trust"] }
 ```
 
 ```rust
+let who = iroh_tunnel::inspect(code)?;                     // kind + endpoint id, no dial
 let tunnel = iroh_tunnel::connect_tunnel(code, 0).await?; // 0 = an ephemeral port
-let base = format!("http://127.0.0.1:{}", tunnel.local_port);
-let lt = tunnel.local_token(); // append ?__lt=<lt> to every request
+let base = tunnel.local_url();
+let lt = tunnel.local_token();                             // append ?__lt=<lt> to every request
 ```
+
+A dial that fails answers a [`DialError`]: `BadCode` (not a code, or
+malformed), `Rejected { kind }` (the server refused the credential — a
+rotated secret, an expired guest token; the one failure a re-dial with the
+same code cannot fix, `is_rejected()`), `Unreachable { reason, relay_online,
+elapsed }` (worth retrying) or `Local`. `connect_tunnel_staged` reports each
+[`Stage`] — bound, relay, connected, handshaken, serving — for a diagnostic
+that has to say which step a hostile network killed.
+
+Two features: `c-abi` (default) is the C ABI and its owned runtime, which a
+Rust consumer turns off so no `#[no_mangle]` symbols land in its binary;
+`os-trust` checks the relay's TLS against the operating system's trust store
+as well as the compiled-in roots, for a host behind a corporate proxy that
+re-signs it.
 
 The library keeps its historical name, `iroh_tunnel`, so that the shipped
 artifacts and the C symbols never changed — hence the `iroh_tunnel::` path.
@@ -78,8 +93,12 @@ for bindings that have no ambient runtime.
 
 ## Use it from another language
 
-Build a binary (below) and call the C ABI — 14 symbols, declared in
-[src/c_api.rs](src/c_api.rs): `mstream_iroh_abi_version`,
+Build a binary (below) or take one from a
+[release](https://github.com/IrosTheBeggar/mstream-iroh-tunnel/releases),
+include `mstream_iroh.h` (generated with cbindgen, committed under
+`include/`, shipped with every release), and call the C ABI — 15 symbols,
+declared in [src/c_api.rs](src/c_api.rs): `mstream_iroh_abi_version`,
+`mstream_iroh_version`,
 `mstream_iroh_start(key, code, port)` → the loopback port, `mstream_iroh_stop`,
 `_is_active`, `_status`, `_path_kind`, `_network_changed`, `_force_reconnect`,
 `_set_credential`, `_drain_events`, `_relay_online`, `_local_token`,
@@ -112,7 +131,7 @@ strips cdylibs with `strip -x`, which keeps the exported C symbols.
 - **iOS** — `rustup target add aarch64-apple-ios aarch64-apple-ios-sim` and
   the Xcode command line tools; `./build-ios.sh` →
   `dist/ios/iroh_tunnel.xcframework` (device + simulator arm64, minos 15.0).
-  The script fails if all 14 symbols are not exported from both slices, or if
+  The script fails if all 15 symbols are not exported from both slices, or if
   the iOS 18-only `nw_path_is_ultra_constrained` import ever returns (it
   crashed the app at launch on iOS 15–17 once).
 - **macOS** — `./build-macos.sh` → `dist/macos/iroh_tunnel.xcframework`
@@ -121,11 +140,15 @@ strips cdylibs with `strip -x`, which keeps the exported C symbols.
   `target/release/iroh_tunnel.dll` or `libiroh_tunnel.so`. The Android-only
   dependencies are `cfg`-gated; nothing else is platform-specific.
 
-Consumers that ship a binary commit it on their side (the mobile app's
-release CI has no Rust toolchain); a stale committed binary is the one
-failure their packaging checks cannot detect, so a bump here means re-staging
-and re-committing there. Tag-driven release assets with checksums are on the
-roadmap, so that step becomes a download.
+Every tag (`v*`) builds all of these on CI and publishes them on the GitHub
+release with `SHA256SUMS`, the header, the dev client, and the SwiftPM
+checksums of the two xcframework zips (`.github/workflows/release.yml`;
+`workflow_dispatch` re-runs it for an existing tag). Consumers that ship a
+binary commit it on their side (the mobile app's release CI has no Rust
+toolchain) and take it from those assets — the mobile app's
+`tool/fetch-iroh-tunnel.sh` does exactly that. A stale committed binary is
+the one failure their packaging checks cannot detect, so a bump here means
+re-staging and re-committing there.
 
 ## Layout
 
@@ -142,19 +165,12 @@ roadmap, so that step becomes a download.
 
 ## Binding choice: C ABI + `dart:ffi` (not flutter_rust_bridge)
 
-The surface is small (abi-version, start / stop / status / path-kind / network-changed / local-token / last-error, force-reconnect / drain-events / relay-online, set-credential, string-free — 14 symbols), so a hand-written C ABI consumed via `dart:ffi` is lighter than a codegen step in the build — one binary plus a small wrapper on the other side. A generated binding remains an option if a richer or streaming surface is ever needed. The Dart side probes `mstream_iroh_abi_version` first and reports the tunnel as unsupported (with the reason in `IrohTunnel.unsupportedReason`) against a binary older than ABI v2, whose `start` takes different arguments — refusing beats misreading.
+The surface is small (abi-version, start / stop / status / path-kind / network-changed / local-token / last-error, force-reconnect / drain-events / relay-online, set-credential, string-free, version — 15 symbols), so a hand-written C ABI consumed via `dart:ffi` is lighter than a codegen step in the build — one binary plus a small wrapper on the other side. A generated binding remains an option if a richer or streaming surface is ever needed. The Dart side probes `mstream_iroh_abi_version` first and reports the tunnel as unsupported (with the reason in `IrohTunnel.unsupportedReason`) against a binary older than ABI v2, whose `start` takes different arguments — refusing beats misreading.
 
 ## Roadmap
 
-- A tag-driven release workflow: per-platform binaries, `SHA256SUMS`, a
-  generated C header.
-- Cargo features `c-abi` (default; off for Rust consumers so no
-  `#[no_mangle]` symbols land in their binaries) and `os-trust` (iroh's
-  `platform-verifier`, for hosts behind a corporate trust store).
-- Typed dial errors (rejected, unreachable, bad code) instead of matching the
-  error text; a staged connect (bind, relay, dial, handshake) so a diagnostic
-  can say which stage died; `mstream_iroh_version()`.
 - crates.io.
+- A Linux aarch64 build among the release assets.
 
 The consumers' migration plan lives in the mobile app repo
 (`IROH_TUNNEL_CRATE_PLAN.md`).
@@ -167,4 +183,8 @@ The consumers' migration plan lives in the mobile app repo
   events ring); keyed tunnels and federation guest mode (ABI v2); iroh 1.1.0
   (a lockfile update that cleared four `cargo audit` advisories).
 - **2026-09-18** — split out of `mstream_music/rust/iroh_tunnel` as this
-  repository.
+  repository (v0.1.0).
+- **2026-09-19** — v0.2.0: typed dial errors, `inspect`, the staged connect,
+  `Tunnel::local_url`, `mstream_iroh_version` (ABI stays 2), the `c-abi` and
+  `os-trust` features, an offline end-to-end test against a fake server
+  endpoint, and the tag-driven release workflow. See `CHANGELOG.md`.

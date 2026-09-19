@@ -1,6 +1,6 @@
 [package]
 name = "mstream-iroh-tunnel"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "mStream remote-access tunnel client: dials a server's iroh endpoint from a Quick Connect pairing code or a federation guest ticket and exposes it as a local HTTP origin. Rust library plus a C ABI for other languages."
 license = "MIT"
@@ -22,6 +22,18 @@ crate-type = ["cdylib", "rlib"]
 [[bin]]
 name = "iroh-tunnel-client"
 path = "src/bin/client.rs"
+required-features = ["c-abi"]
+
+[features]
+default = ["c-abi"]
+# The C ABI (`mstream_iroh_*`) and the owned runtime behind it — what a
+# binding loads. A Rust consumer turns it off so no `#[no_mangle]` symbols
+# land in its own binary.
+c-abi = []
+# Check the relay's TLS against the operating system's trust store as well as
+# the compiled-in roots: a corporate network that inspects TLS re-signs the
+# relay with a CA only the system store knows.
+os-trust = ["iroh/platform-verifier"]
 
 [dependencies]
 # iroh CORE only — no iroh-blobs/docs/gossip/rpc (keeps the Android .so small).

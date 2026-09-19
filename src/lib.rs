@@ -17,7 +17,9 @@
 //! The Dart/Android entry points live in [`ffi`] (owned Tokio runtime + start/stop);
 //! [`c_api`] exposes those over a C ABI for `dart:ffi`.
 
+#[cfg(feature = "c-abi")]
 pub mod c_api;
+#[cfg(feature = "c-abi")]
 pub mod ffi;
 
 // Android-only JNI entry point that registers the app Context with ndk_context
@@ -33,7 +35,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, Watcher as _};
+use iroh::{Endpoint, EndpointAddr, TransportAddr, Watcher as _};
 use iroh_tickets::endpoint::EndpointTicket;
 use iroh_tickets::Ticket as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -267,6 +269,7 @@ impl Shared {
 }
 
 pub(crate) const PLATFORM_LOG_INFO: i32 = 4; // ANDROID_LOG_INFO
+#[cfg_attr(not(feature = "c-abi"), allow(dead_code))]
 pub(crate) const PLATFORM_LOG_ERROR: i32 = 6; // ANDROID_LOG_ERROR
 
 /// Mirror a line to the platform log (`adb logcat -s iroh_tunnel`). No-op
@@ -330,6 +333,11 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
+    /// The base URL the tunnel serves the server at.
+    pub fn local_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.local_port)
+    }
+
     /// Current status (one of the `STATUS_*` constants).
     pub fn status(&self) -> u8 {
         self.shared.status.load(Ordering::Relaxed)
@@ -513,6 +521,12 @@ enum DialResult {
     Failed(String), // transient: unreachable / timeout / mid-handshake error, with why
 }
 
+/// A connection close whose reason says the credential was refused.
+fn is_refusal(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    ["unauthorized", "backoff", "revoked"].iter().any(|word| e.contains(word))
+}
+
 /// Connect on `alpn` and run the handshake on the first bi-stream: write the
 /// credential (the 32-byte connect secret, or a guest token), expect "OK".
 async fn dial_and_handshake(
@@ -521,21 +535,26 @@ async fn dial_and_handshake(
     alpn: &[u8],
     payload: &[u8],
 ) -> DialResult {
-    let conn = match tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr.clone(), alpn))
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => return DialResult::Failed(format!("connect error: {e}")),
-        Err(_) => {
-            return DialResult::Failed(format!(
-                "connect timed out after {}s",
-                CONNECT_TIMEOUT.as_secs()
-            ))
-        }
-    };
-    // Bound the handshake so a stalled/half-dead server can't park the supervisor.
+    match dial(endpoint, addr, alpn).await {
+        Ok(conn) => handshake(conn, payload).await,
+        Err(why) => DialResult::Failed(why),
+    }
+}
+
+/// The QUIC connection, bounded.
+async fn dial(endpoint: &Endpoint, addr: &EndpointAddr, alpn: &[u8]) -> Result<Connection, String> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr.clone(), alpn)).await {
+        Ok(Ok(c)) => Ok(c),
+        Ok(Err(e)) => Err(format!("connect error: {e}")),
+        Err(_) => Err(format!("connect timed out after {}s", CONNECT_TIMEOUT.as_secs())),
+    }
+}
+
+/// The credential on the first bi-stream, bounded so a stalled or half-dead
+/// server cannot park the supervisor.
+async fn handshake(conn: Connection, payload: &[u8]) -> DialResult {
     let probe = conn.clone(); // the block below owns `conn`; the stall report reads the path off this
-    let handshake = async {
+    let attempt = async {
         let (mut send, mut recv) = match conn.open_bi().await {
             Ok(pair) => pair,
             Err(e) => return DialResult::Failed(format!("open_bi: {e}")),
@@ -549,10 +568,15 @@ async fn dial_and_handshake(
             // Empty / unexpected reply (truncation, a non-conforming server) is
             // transient — retry rather than declaring a permanent "re-pair".
             Ok(resp) => DialResult::Failed(format!("unexpected handshake reply ({} bytes)", resp.len())),
+            // The server may also refuse by closing the connection with a
+            // reason instead of answering (mStream's federation endpoint
+            // does: "unauthorized", "backoff", "revoked") — a refusal all
+            // the same, not a network that went away.
+            Err(e) if is_refusal(&e.to_string()) => DialResult::Rejected,
             Err(e) => DialResult::Failed(format!("handshake read: {e}")),
         }
     };
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, attempt).await {
         Ok(result) => result,
         Err(_) => {
             // Transient. Say which path the connection sat on while the server
@@ -698,6 +722,93 @@ async fn wait_backoff(shared: &Shared, backoff: Duration, kick_seen: u64) -> boo
     }
 }
 
+/// Why a dial did not end in a serving tunnel. The `Display` text is what the
+/// C ABI's `last_error` and the dev CLI print, and it keeps the words the
+/// bindings match on: a refused credential says "rejected".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialError {
+    /// The credential is not a code this client understands, or is malformed.
+    BadCode(String),
+    /// The server refused the credential: a wrong or rotated connect secret,
+    /// or an expired or revoked guest token. Re-dialling the same code will
+    /// not help; a new one might.
+    Rejected { kind: PairingKind },
+    /// The server could not be reached, or never answered the handshake —
+    /// worth retrying. `relay_online` says whether this machine reached the
+    /// iroh relay network at all, which points the blame one way or the other.
+    Unreachable { reason: String, relay_online: bool, elapsed: Duration },
+    /// A failure on this side: the endpoint or the loopback port would not bind.
+    Local(String),
+}
+
+impl std::fmt::Display for DialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DialError::BadCode(why) => write!(f, "{why}"),
+            DialError::Rejected { kind: PairingKind::Tunnel } => write!(
+                f,
+                "tunnel handshake rejected — wrong or rotated connect secret; re-pair from the server's Remote Access panel"
+            ),
+            DialError::Rejected { kind: PairingKind::FederationGuest } => write!(
+                f,
+                "handshake rejected — the guest token was refused (expired or revoked); refresh it from the parent server"
+            ),
+            DialError::Unreachable { reason, relay_online, elapsed } => write!(
+                f,
+                "could not reach the server through the tunnel ({reason}; home relay {}; {:.1}s) — it may be offline or the pairing code is stale",
+                if *relay_online { "online" } else { "not reached" },
+                elapsed.as_secs_f32()
+            ),
+            DialError::Local(why) => write!(f, "{why}"),
+        }
+    }
+}
+
+impl std::error::Error for DialError {}
+
+impl DialError {
+    /// The server said no to the credential itself, as opposed to not
+    /// answering: the one failure a re-dial with the same code cannot fix.
+    pub fn is_rejected(&self) -> bool {
+        matches!(self, DialError::Rejected { .. })
+    }
+}
+
+/// What a code says before anything is dialled: the kind of server it reaches
+/// and that server's iroh endpoint id (a public key — the stable identity a
+/// client can file the server under, whatever port or network the tunnel
+/// lands on).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Credential {
+    pub kind: PairingKind,
+    pub endpoint_id: String,
+}
+
+/// Parse a code for what it names, without dialling.
+pub fn inspect(code: &str) -> Result<Credential, DialError> {
+    let pairing = parse_pairing_code(code)?;
+    let ticket = EndpointTicket::decode_string(&pairing.ticket)
+        .map_err(|e| DialError::BadCode(format!("invalid endpoint ticket: {e}")))?;
+    Ok(Credential { kind: pairing.kind, endpoint_id: ticket.endpoint_addr().id.to_string() })
+}
+
+/// The steps of a dial, in order, as [`connect_tunnel_staged`] reports them —
+/// so a diagnostic can say which one a hostile network killed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stage {
+    /// The local iroh endpoint is bound.
+    Bound,
+    /// The wait for a home relay ended: reached (with its URL) or not, in
+    /// which case the dial goes on over direct addresses anyway.
+    Relay { online: bool, url: Option<String> },
+    /// The server accepted the QUIC connection.
+    Connected,
+    /// The server accepted the credential.
+    Handshaken,
+    /// The loopback bridge is listening; the tunnel is ready to serve.
+    Serving { local_port: u16 },
+}
+
 /// Which kind of server a code dials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingKind {
@@ -772,24 +883,24 @@ fn field_str(v: &serde_json::Value, key: &str) -> Option<String> {
 /// a standing key) is refused by name — the app must never hold one. A version
 /// newer than this client understands is rejected with an actionable "update
 /// the app" error. Pure (no native module).
-fn parse_pairing_code(code: &str) -> Result<Pairing> {
+fn parse_pairing_code(code: &str) -> Result<Pairing, DialError> {
     let trimmed = code.trim();
 
     // The guest envelope first: its prefix extends the tunnel one, and the
     // tunnel branch would otherwise read `fedg1` as a missing version.
     if let Some((version, body)) = split_envelope(trimmed, "mstrfedg") {
         if version > GUEST_TICKET_VERSION {
-            bail!(
+            return Err(DialError::BadCode(format!(
                 "Guest ticket is version {version}; this app supports up to v{GUEST_TICKET_VERSION}. Update to a newer version of the app."
-            );
+            )));
         }
-        let v = decode_body(body, "guest ticket")?;
+        let v = decode_body(body, "guest ticket").map_err(bad_code)?;
         let ticket =
-            field_str(&v, "t").ok_or_else(|| anyhow!("invalid guest ticket (missing ticket)"))?;
+            field_str(&v, "t").ok_or_else(|| DialError::BadCode("invalid guest ticket (missing ticket)".to_string()))?;
         let token =
-            field_str(&v, "g").ok_or_else(|| anyhow!("invalid guest ticket (missing token)"))?;
+            field_str(&v, "g").ok_or_else(|| DialError::BadCode("invalid guest ticket (missing token)".to_string()))?;
         if token.is_empty() || token.len() > GUEST_TOKEN_MAX {
-            bail!("invalid guest ticket (token length {})", token.len());
+            return Err(DialError::BadCode(format!("invalid guest ticket (token length {})", token.len())));
         }
         return Ok(Pairing {
             ticket,
@@ -799,25 +910,26 @@ fn parse_pairing_code(code: &str) -> Result<Pairing> {
         });
     }
     if split_envelope(trimmed, "mstrfed").is_some() {
-        bail!(
-            "This is a federation ticket for pairing two servers, not a pairing code for the app."
-        );
+        return Err(DialError::BadCode(
+            "This is a federation ticket for pairing two servers, not a pairing code for the app.".to_string()
+            ));
     }
 
     let (version, body) = split_envelope(trimmed, "mstr").unwrap_or((1, trimmed));
     if version > PAIRING_VERSION {
-        bail!(
+        return Err(DialError::BadCode(format!(
             "Pairing code is version {version}; this app supports up to v{PAIRING_VERSION}. Update to a newer version of the app."
-        );
+        )));
     }
-    let v = decode_body(body, "pairing code")?;
+    let v = decode_body(body, "pairing code").map_err(bad_code)?;
     let ticket =
-        field_str(&v, "t").ok_or_else(|| anyhow!("invalid pairing code (missing ticket)"))?;
+        field_str(&v, "t").ok_or_else(|| DialError::BadCode("invalid pairing code (missing ticket)".to_string()))?;
     let secret_b64 =
-        field_str(&v, "s").ok_or_else(|| anyhow!("invalid pairing code (missing secret)"))?;
-    let secret = b64_loose(&secret_b64).context("invalid pairing code (bad secret)")?;
+        field_str(&v, "s").ok_or_else(|| DialError::BadCode("invalid pairing code (missing secret)".to_string()))?;
+    let secret = b64_loose(&secret_b64)
+        .map_err(|e| DialError::BadCode(format!("invalid pairing code (bad secret): {e}")))?;
     if secret.len() != SECRET_LEN {
-        bail!("connect secret must be {SECRET_LEN} bytes (got {})", secret.len());
+        return Err(DialError::BadCode(format!("connect secret must be {SECRET_LEN} bytes (got {})", secret.len())));
     }
     Ok(Pairing {
         ticket,
@@ -827,56 +939,88 @@ fn parse_pairing_code(code: &str) -> Result<Pairing> {
     })
 }
 
+fn bad_code(e: anyhow::Error) -> DialError {
+    DialError::BadCode(format!("{e:#}"))
+}
+
+/// Bind the local iroh endpoint. With the `os-trust` feature the relay's TLS
+/// is checked against what the operating system trusts, not only the
+/// compiled-in roots — a corporate network that inspects TLS re-signs the
+/// relay with a CA only the system store knows. The environment's proxy is
+/// honoured either way, for a network that drops direct dials on the floor.
+async fn bind_endpoint() -> Result<Endpoint, DialError> {
+    let builder = Endpoint::builder(presets::N0).proxy_from_env();
+    #[cfg(feature = "os-trust")]
+    let builder = builder.ca_tls_config(iroh::tls::CaTlsConfig::system());
+    builder
+        .bind()
+        .await
+        .map_err(|e| DialError::Local(format!("failed to bind iroh endpoint: {e}")))
+}
+
+/// The home relay this endpoint is on, if it has one yet.
+fn home_relay_url(endpoint: &Endpoint) -> Option<String> {
+    endpoint.addr().addrs.into_iter().find_map(|addr| match addr {
+        TransportAddr::Relay(url) => Some(url.to_string()),
+        _ => None,
+    })
+}
+
 /// Dial a tunnel from a pairing code, complete the secret handshake, and start a
 /// loopback TCP proxy with a reconnect supervisor. Returns once it's ready to serve.
 /// `local_port` of 0 picks an ephemeral port (the chosen port is in [`Tunnel`]).
-pub async fn connect_tunnel(code: &str, local_port: u16) -> Result<Tunnel> {
-    let pairing = parse_pairing_code(code)?;
+pub async fn connect_tunnel(code: &str, local_port: u16) -> Result<Tunnel, DialError> {
+    connect_tunnel_staged(code, local_port, &mut |_| {}).await
+}
 
-    let endpoint = Endpoint::bind(presets::N0)
-        .await
-        .context("failed to bind iroh endpoint")?;
+/// [`connect_tunnel`], reporting each [`Stage`] as it completes — for a
+/// diagnostic that has to say which step a hostile network killed.
+pub async fn connect_tunnel_staged(
+    code: &str,
+    local_port: u16,
+    on_stage: &mut dyn FnMut(Stage),
+) -> Result<Tunnel, DialError> {
+    let pairing = parse_pairing_code(code)?;
+    let ticket = EndpointTicket::decode_string(&pairing.ticket)
+        .map_err(|e| DialError::BadCode(format!("invalid endpoint ticket: {e}")))?;
+    let addr = ticket.endpoint_addr().clone();
+
+    let endpoint = bind_endpoint().await?;
+    on_stage(Stage::Bound);
 
     // Cross-network: establish our own home relay BEFORE dialing, else the first
     // stream can reset on a not-ready path. Bounded; proceed even if it times out.
-    let _ = tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()).await;
-
-    let ticket = EndpointTicket::decode_string(&pairing.ticket)
-        .map_err(|e| anyhow!("invalid endpoint ticket: {e}"))?;
-    let addr = ticket.endpoint_addr().clone();
+    let online = tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()).await.is_ok();
+    on_stage(Stage::Relay { online, url: home_relay_url(&endpoint) });
 
     // First dial + handshake; distinguish a rejected secret for a clear error.
     // The failure reason and relay state ride along: "may be offline" used to
     // hide "no home relay within 8s; connect timed out after 25s".
     let t0 = Instant::now();
-    let conn = match dial_and_handshake(&endpoint, &addr, pairing.alpn, &pairing.payload).await {
-        DialResult::Connected(c) => c,
-        DialResult::Rejected => bail!(
-            "{}",
-            match pairing.kind {
-                PairingKind::Tunnel =>
-                    "tunnel handshake rejected — wrong or rotated connect secret; re-pair from the server's Remote Access panel",
-                PairingKind::FederationGuest =>
-                    "handshake rejected — the guest token was refused (expired or revoked); refresh it from the parent server",
-            }
-        ),
-        DialResult::Failed(reason) => {
-            let relay = if endpoint.home_relay_status().get().iter().any(|r| r.is_connected()) {
-                "online"
-            } else {
-                "not reached"
-            };
-            bail!(
-                "could not reach the server through the tunnel ({reason}; home relay {relay}; {:.1}s) — it may be offline or the pairing code is stale",
-                t0.elapsed().as_secs_f32()
-            )
-        }
+    let unreachable = |reason: String, endpoint: &Endpoint| DialError::Unreachable {
+        reason,
+        relay_online: endpoint.home_relay_status().get().iter().any(|r| r.is_connected()),
+        elapsed: t0.elapsed(),
     };
+    let conn = match dial(&endpoint, &addr, pairing.alpn).await {
+        Ok(conn) => conn,
+        Err(reason) => return Err(unreachable(reason, &endpoint)),
+    };
+    on_stage(Stage::Connected);
+    let conn = match handshake(conn, &pairing.payload).await {
+        DialResult::Connected(c) => c,
+        DialResult::Rejected => return Err(DialError::Rejected { kind: pairing.kind }),
+        DialResult::Failed(reason) => return Err(unreachable(reason, &endpoint)),
+    };
+    on_stage(Stage::Handshaken);
 
     let listener = TcpListener::bind(("127.0.0.1", local_port))
         .await
-        .context("failed to bind local proxy port")?;
-    let bound_port = listener.local_addr()?.port();
+        .map_err(|e| DialError::Local(format!("failed to bind local proxy port: {e}")))?;
+    let bound_port = listener
+        .local_addr()
+        .map_err(|e| DialError::Local(format!("failed to read the local proxy port: {e}")))?
+        .port();
 
     let (status_tx, _status_rx) = watch::channel(STATUS_CONNECTED);
     let path = {
@@ -902,7 +1046,7 @@ pub async fn connect_tunnel(code: &str, local_port: u16) -> Result<Tunnel> {
         status: AtomicU8::new(STATUS_CONNECTED),
         status_tx,
         active_bridges: AtomicUsize::new(0),
-        local_token: gen_local_token()?,
+        local_token: gen_local_token().map_err(|e| DialError::Local(format!("{e:#}")))?,
         local_port: bound_port,
         accept: Mutex::new(None),
         supervisor: Mutex::new(None),
@@ -924,6 +1068,7 @@ pub async fn connect_tunnel(code: &str, local_port: u16) -> Result<Tunnel> {
 
     let supervisor = tokio::spawn(supervise(shared.clone()));
     *shared.supervisor.lock().unwrap() = Some(supervisor);
+    on_stage(Stage::Serving { local_port: bound_port });
 
     Ok(Tunnel {
         local_port: bound_port,
@@ -1136,6 +1281,170 @@ async fn pump_recv_to_writer(mut recv: RecvStream, mut w: OwnedWriteHalf) -> boo
 mod tests {
     use super::*;
     use base64::Engine;
+
+    // A real ticket captured from a running mStream tunnel: what `inspect`
+    // decodes for the endpoint id (the parse itself keeps the string whole).
+    const REAL_TICKET: &str = "endpointabrraywtjw6g3m7gofwzvgif4t7p7b7olzxcske4lei7axhn53gmkbaaenuhi5dqom5c6l3vonstcljrfzzgk3dbpexg4mbonfzg62bonruw42zof4aqasj432dpvxydaeakyhaaah5n6aybadakqakh7lpqg";
+
+    /// Stand up an endpoint speaking the server half of the tunnel protocol,
+    /// as mStream implements it — the first bi-stream carries the secret and
+    /// is answered OK (or NO), every later one is one TCP connection's worth
+    /// of bytes to a local HTTP port that always answers `http_response` —
+    /// and hand back its ticket. Relay-free, dialled by direct addresses: the
+    /// test needs no network beyond this machine.
+    fn fake_mstream_endpoint(
+        rt: &tokio::runtime::Runtime,
+        secret: [u8; SECRET_LEN],
+        http_response: &'static [u8],
+    ) -> String {
+        let http = std::net::TcpListener::bind("127.0.0.1:0").expect("bind http");
+        let http_port = http.local_addr().expect("http addr").port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while let Ok((mut sock, _)) = http.accept() {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 256];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&byte[..n]),
+                    }
+                }
+                let _ = sock.write_all(http_response);
+            }
+        });
+
+        let addr = rt.block_on(async move {
+            let endpoint = Endpoint::builder(presets::Minimal)
+                .alpns(vec![TUNNEL_ALPN.to_vec()])
+                .bind()
+                .await
+                .expect("bind server endpoint");
+            let addr = endpoint.addr();
+            tokio::spawn(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let Ok(connection) = incoming.await else { continue };
+                    tokio::spawn(async move {
+                        let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                            return;
+                        };
+                        let got = recv.read_to_end(256).await.unwrap_or_default();
+                        if got != secret {
+                            // As the server does: the verdict, then the
+                            // connection closed with a reason.
+                            let _ = send.write_all(b"NO").await;
+                            let _ = send.finish();
+                            let _ = send.stopped().await;
+                            connection.close(0u32.into(), b"unauthorized");
+                            return;
+                        }
+                        let _ = send.write_all(b"OK").await;
+                        let _ = send.finish();
+                        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                            tokio::spawn(async move {
+                                let Ok(tcp) =
+                                    tokio::net::TcpStream::connect(("127.0.0.1", http_port)).await
+                                else {
+                                    return;
+                                };
+                                let (mut tcp_read, mut tcp_write) = tcp.into_split();
+                                let up = async {
+                                    let _ = tokio::io::copy(&mut recv, &mut tcp_write).await;
+                                };
+                                let down = async {
+                                    let _ = tokio::io::copy(&mut tcp_read, &mut send).await;
+                                    let _ = send.finish();
+                                };
+                                tokio::join!(up, down);
+                            });
+                        }
+                    });
+                }
+            });
+            addr
+        });
+        EndpointTicket::from(addr).to_string()
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime")
+    }
+
+    #[test]
+    fn inspect_names_the_server_without_dialling() {
+        let code = format!("mstr1:{}", body(REAL_TICKET, &[9u8; SECRET_LEN]));
+        let cred = inspect(&code).expect("inspect");
+        assert_eq!(cred.kind, PairingKind::Tunnel);
+        assert!(cred.endpoint_id.len() > 40, "an endpoint id is a public key: {}", cred.endpoint_id);
+        // The same server, a new secret: the identity holds still.
+        let again = inspect(&format!("mstr1:{}", body(REAL_TICKET, &[10u8; SECRET_LEN]))).unwrap();
+        assert_eq!(again.endpoint_id, cred.endpoint_id);
+        // A guest ticket names its kind.
+        let json = format!(r#"{{"t":"{REAL_TICKET}","g":"guest-token"}}"#);
+        let guest = format!("mstrfedg1:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json));
+        assert_eq!(inspect(&guest).unwrap().kind, PairingKind::FederationGuest);
+    }
+
+    #[test]
+    fn a_bad_code_is_a_typed_error_with_the_old_words() {
+        let err = inspect("mstr9:whatever").unwrap_err();
+        assert!(matches!(err, DialError::BadCode(_)));
+        assert!(err.to_string().contains("Update"), "{err}");
+        assert!(!err.is_rejected());
+        assert!(matches!(inspect("garbage").unwrap_err(), DialError::BadCode(_)));
+        // The refusal keeps the word the bindings and the harness match on.
+        let refused = DialError::Rejected { kind: PairingKind::Tunnel };
+        assert!(refused.is_rejected());
+        assert!(refused.to_string().contains("rejected"));
+        assert!(DialError::Rejected { kind: PairingKind::FederationGuest }.to_string().contains("rejected"));
+    }
+
+    /// The whole client path against a live endpoint speaking the server's
+    /// protocol — parse, bind, dial, handshake, bridge, one HTTP round trip
+    /// with the loopback token — with the stages reported in order; then a
+    /// wrong secret, refused as a typed rejection.
+    #[test]
+    fn dials_through_the_stages_and_a_wrong_secret_is_rejected() {
+        const SECRET: [u8; SECRET_LEN] = [42u8; SECRET_LEN];
+        let rt = runtime();
+        let ticket = fake_mstream_endpoint(
+            &rt,
+            SECRET,
+            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nhi",
+        );
+        let code = format!("mstr1:{}", body(&ticket, &SECRET));
+
+        let mut stages = Vec::new();
+        let tunnel = rt
+            .block_on(connect_tunnel_staged(&code, 0, &mut |stage| stages.push(stage)))
+            .expect("open tunnel");
+        assert_eq!(stages[0], Stage::Bound);
+        assert!(matches!(stages[1], Stage::Relay { .. }), "{stages:?}");
+        assert_eq!(&stages[2..], &[Stage::Connected, Stage::Handshaken, Stage::Serving { local_port: tunnel.local_port }]);
+        assert_eq!(tunnel.local_url(), format!("http://127.0.0.1:{}", tunnel.local_port));
+        assert_eq!(tunnel.kind(), PairingKind::Tunnel);
+
+        use std::io::{Read, Write};
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", tunnel.local_port)).expect("connect bridge");
+        let request = format!(
+            "GET /api/v1/ping?__lt={} HTTP/1.1\r\nhost: tunnel\r\nconnection: close\r\n\r\n",
+            tunnel.local_token()
+        );
+        sock.write_all(request.as_bytes()).expect("send request");
+        sock.shutdown(std::net::Shutdown::Write).expect("half-close");
+        let mut reply = String::new();
+        let _ = sock.read_to_string(&mut reply);
+        assert!(reply.starts_with("HTTP/1.1 200 OK") && reply.ends_with("hi"), "got: {reply}");
+        tunnel.begin_shutdown(&rt);
+
+        let wrong = format!("mstr1:{}", body(&ticket, &[1u8; SECRET_LEN]));
+        let err = match rt.block_on(connect_tunnel(&wrong, 0)) {
+            Ok(_) => panic!("a wrong secret must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err, DialError::Rejected { kind: PairingKind::Tunnel });
+        assert!(err.to_string().contains("rejected"));
+    }
 
     fn body(t: &str, secret: &[u8]) -> String {
         let s = base64::engine::general_purpose::STANDARD.encode(secret);

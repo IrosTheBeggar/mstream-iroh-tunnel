@@ -26,6 +26,12 @@ use crate::{connect_tunnel, Tunnel, PATH_UNKNOWN, STATUS_CONNECTED, STATUS_DOWN}
 /// `mstream_iroh_abi_version` and refuses a binary older than it expects.
 pub const ABI_VERSION: i32 = 2;
 
+/// The crate version this binary was built from (`CARGO_PKG_VERSION`), for a
+/// binding's diagnostics log. Additive to ABI v2.
+pub fn tunnel_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static TUNNELS: Mutex<BTreeMap<String, Tunnel>> = Mutex::new(BTreeMap::new());
 

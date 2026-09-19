@@ -115,6 +115,14 @@ pub extern "C" fn mstream_iroh_abi_version() -> i32 {
     ABI_VERSION
 }
 
+/// The crate version this binary was built from, as a heap C string the caller
+/// OWNS and must free with [`mstream_iroh_string_free`]. Additive to ABI v2 —
+/// a binding that finds the symbol missing is holding an older binary.
+#[no_mangle]
+pub extern "C" fn mstream_iroh_version() -> *mut c_char {
+    string_out(Some(crate::ffi::tunnel_version().to_string()))
+}
+
 /// Start the tunnel for `key` from a NUL-terminated UTF-8 code (a Quick Connect
 /// pairing code or a federation guest ticket). Returns the loopback port (> 0)
 /// on success, or -1 on error — then call [`mstream_iroh_last_error`].
