@@ -2,9 +2,9 @@
 # library plus the dev client on the three desktop hosts; then the interop
 # harness — the Rust client against a replica of the mStream server's iroh
 # endpoint (interop/harness.mjs, on @number0/iroh). The harness needs UDP and
-# an iroh relay from the runner, so it is advisory until it has been green
-# for a while; the per-platform release binaries are a separate, tag-driven
-# workflow (not written yet — see the README's roadmap).
+# an iroh relay from the runner; it was advisory while that was unproven and
+# is required now that it has stayed green. The per-platform release
+# binaries are the tag-driven workflow next to this one (release.yml).
 name: CI
 
 on:
@@ -39,7 +39,6 @@ jobs:
   interop:
     name: Interop harness (Rust client ⇆ JS server)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

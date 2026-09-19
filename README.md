@@ -140,9 +140,9 @@ strips cdylibs with `strip -x`, which keeps the exported C symbols.
   `target/release/iroh_tunnel.dll` or `libiroh_tunnel.so`. The Android-only
   dependencies are `cfg`-gated; nothing else is platform-specific.
 
-Every tag (`v*`) builds all of these on CI and publishes them on the GitHub
-release with `SHA256SUMS`, the header, the dev client, and the SwiftPM
-checksums of the two xcframework zips (`.github/workflows/release.yml`;
+Every tag (`v*`) builds all of these on CI (Linux for x86_64 and aarch64)
+and publishes them on the GitHub release with `SHA256SUMS`, the header, the
+dev client, and the SwiftPM checksums of the two xcframework zips (`.github/workflows/release.yml`;
 `workflow_dispatch` re-runs it for an existing tag). Consumers that ship a
 binary commit it on their side (the mobile app's release CI has no Rust
 toolchain) and take it from those assets — the mobile app's
@@ -170,7 +170,6 @@ The surface is small (abi-version, start / stop / status / path-kind / network-c
 ## Roadmap
 
 - crates.io.
-- A Linux aarch64 build among the release assets.
 
 The consumers' migration plan lives in the mobile app repo
 (`IROH_TUNNEL_CRATE_PLAN.md`).
