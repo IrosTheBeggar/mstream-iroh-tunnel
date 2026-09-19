@@ -139,25 +139,26 @@ jobs:
       - name: Build the library and the dev client
         run: cargo build --release --locked --lib --bin iroh-tunnel-client
       - name: Generate the C header and check it against the committed one
+        # A tag from before the header existed (v0.1.0) has no cbindgen
+        # config and ships without a header; a tag that has one must match
+        # the committed header exactly.
         run: |
           set -euo pipefail
+          if [ ! -f cbindgen.toml ]; then
+            echo "no cbindgen.toml at this tag — no header for this release"
+            exit 0
+          fi
           cargo install cbindgen --locked
           cbindgen --config cbindgen.toml --crate mstream-iroh-tunnel --output /tmp/mstream_iroh.h
-          # A tag from before the header was committed (v0.1.0) ships the
-          # generated one; a tag that has it must match it.
-          if [ -f include/mstream_iroh.h ]; then
-            diff -u include/mstream_iroh.h /tmp/mstream_iroh.h \
-              || { echo "::error::include/mstream_iroh.h is stale — regenerate it with cbindgen and commit"; exit 1; }
-          else
-            mkdir -p include && cp /tmp/mstream_iroh.h include/
-          fi
+          diff -u include/mstream_iroh.h /tmp/mstream_iroh.h \
+            || { echo "::error::include/mstream_iroh.h is stale — regenerate it with cbindgen and commit"; exit 1; }
       - name: Package
         run: |
           set -euo pipefail
           tag="${{ inputs.tag || github.ref_name }}"
           mkdir -p out
           (cd target/release && zip -q "../../out/iroh_tunnel-$tag-linux-x86_64.zip" libiroh_tunnel.so iroh-tunnel-client)
-          cp include/mstream_iroh.h out/
+          [ -f include/mstream_iroh.h ] && cp include/mstream_iroh.h out/ || true
           ls -l out
       - uses: actions/upload-artifact@v4
         with:
