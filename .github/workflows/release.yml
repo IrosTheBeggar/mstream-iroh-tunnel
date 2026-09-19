@@ -1,0 +1,202 @@
+# Tag-driven releases: push a `v*` tag (or dispatch with one) to build the
+# library for every platform a consumer loads it on, plus the dev client for
+# the desktop hosts, and publish them on the GitHub release with checksums.
+#
+# Assets, named for the fetch scripts that download them:
+#   iroh_tunnel-<tag>-android.zip              arm64-v8a/ and x86_64/ libiroh_tunnel.so (API 26)
+#   iroh_tunnel-<tag>-ios.xcframework.zip      iroh_tunnel.xcframework (device + simulator arm64)
+#   iroh_tunnel-<tag>-macos.xcframework.zip    iroh_tunnel.xcframework (arm64)
+#   iroh_tunnel-<tag>-windows-x86_64.zip       iroh_tunnel.dll + iroh-tunnel-client.exe
+#   iroh_tunnel-<tag>-linux-x86_64.zip         libiroh_tunnel.so + iroh-tunnel-client
+#   iroh-tunnel-client-<tag>-macos-arm64.zip   the dev client for macOS
+#   mstream_iroh.h                             the C header (cbindgen, checked against the committed one)
+#   SHA256SUMS                                 one line per asset above
+#   SWIFTPM-CHECKSUMS.txt                      `swift package compute-checksum` of the two xcframework zips,
+#                                              for a remote `binaryTarget(url:checksum:)`
+#
+# The xcframeworks are ad-hoc signed, as the build scripts always did: Xcode
+# re-signs with the app's identity when it embeds them.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'The tag to build and release (e.g. v0.2.0); must exist'
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  android:
+    name: Android (.so)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Build both ABIs
+        # The runner image ships an NDK and names it in its own environment.
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"
+          echo "NDK: $ANDROID_NDK_HOME"
+          ./build-android.sh
+      - name: Package
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          mkdir -p out
+          (cd dist/android && zip -qr "../../out/iroh_tunnel-$tag-android.zip" arm64-v8a x86_64)
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: out/*
+
+  apple:
+    name: iOS + macOS (xcframeworks) and the macOS client
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the iOS xcframework
+        run: ./build-ios.sh
+      - name: Build the macOS xcframework
+        run: ./build-macos.sh
+      - name: Build the dev client
+        run: cargo build --release --locked --bin iroh-tunnel-client --target aarch64-apple-darwin
+      - name: Package
+        # ditto keeps the macOS framework's symlinks as symlinks, which a
+        # SwiftPM binaryTarget zip needs.
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          mkdir -p out
+          (cd dist/ios && ditto -c -k --keepParent iroh_tunnel.xcframework "../../out/iroh_tunnel-$tag-ios.xcframework.zip")
+          (cd dist/macos && ditto -c -k --keepParent iroh_tunnel.xcframework "../../out/iroh_tunnel-$tag-macos.xcframework.zip")
+          (cd target/aarch64-apple-darwin/release && zip -q "../../../out/iroh-tunnel-client-$tag-macos-arm64.zip" iroh-tunnel-client)
+          {
+            echo "# swift package compute-checksum, for a remote binaryTarget(url:checksum:)"
+            for f in out/*.xcframework.zip; do
+              echo "$(swift package compute-checksum "$f")  $(basename "$f")"
+            done
+          } > out/SWIFTPM-CHECKSUMS.txt
+          cat out/SWIFTPM-CHECKSUMS.txt
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apple
+          path: out/*
+
+  windows:
+    name: Windows (.dll)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the library and the dev client
+        run: cargo build --release --locked --lib --bin iroh-tunnel-client
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          mkdir -p out
+          (cd target/release && 7z a -tzip "../../out/iroh_tunnel-$tag-windows-x86_64.zip" iroh_tunnel.dll iroh-tunnel-client.exe > /dev/null)
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+
+  linux:
+    name: Linux (.so) and the header
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the library and the dev client
+        run: cargo build --release --locked --lib --bin iroh-tunnel-client
+      - name: Generate the C header and check it against the committed one
+        run: |
+          set -euo pipefail
+          cargo install cbindgen --locked
+          cbindgen --config cbindgen.toml --crate mstream-iroh-tunnel --output /tmp/mstream_iroh.h
+          # A tag from before the header was committed (v0.1.0) ships the
+          # generated one; a tag that has it must match it.
+          if [ -f include/mstream_iroh.h ]; then
+            diff -u include/mstream_iroh.h /tmp/mstream_iroh.h \
+              || { echo "::error::include/mstream_iroh.h is stale — regenerate it with cbindgen and commit"; exit 1; }
+          else
+            mkdir -p include && cp /tmp/mstream_iroh.h include/
+          fi
+      - name: Package
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          mkdir -p out
+          (cd target/release && zip -q "../../out/iroh_tunnel-$tag-linux-x86_64.zip" libiroh_tunnel.so iroh-tunnel-client)
+          cp include/mstream_iroh.h out/
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: out/*
+
+  release:
+    name: Publish
+    needs: [android, apple, windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd assets
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Release notes
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          {
+            echo "Binaries of the mStream tunnel client at \`$tag\` for every platform a consumer loads it on, plus the C header and the dev client. Verify with \`SHA256SUMS\`."
+            echo
+            echo "### SwiftPM checksums"
+            echo '```'
+            cat assets/SWIFTPM-CHECKSUMS.txt
+            echo '```'
+          } > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          body_path: notes.md
+          files: assets/*
+          fail_on_unmatched_files: true
