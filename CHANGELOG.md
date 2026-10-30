@@ -1,7 +1,18 @@
 # Changelog
 
-## Unreleased
+## v0.2.1 — 2026-10-30
 
+A dependency refresh: the lockfile only, no API change (ABI stays 2).
+
+- `Cargo.lock`: iroh 1.1.0 → 1.4.1, rustls 0.23.44 → 0.23.46, tokio 1.53.1 →
+  1.54.1 and the rest of the tree, all within the manifest’s ranges (iroh 1.4’s
+  resolver swap drops 22 crates). Clears the nine
+  `cargo audit` advisories the old tree carried: five in rustls
+  (RUSTSEC-2026-0285, -0346 to -0349), the distrusted-intermediate ones in
+  rustls-webpki and the webpki root bundles (-0381 to -0383) and the
+  constant-time one in ctutils (-0385); and the tokio `AsyncFd` unsoundness
+  warning (-0386). iroh 1.4 also updates its advertised addresses at once on
+  a relay-less LAN change and sends the relay the `X-Iroh-Endpoint-Id` header.
 - The release workflow also builds `iroh_tunnel-<tag>-linux-aarch64.zip`
   (on GitHub's arm64 Linux runner), for Raspberry Pis, Graviton hosts and
   Apple-silicon VMs.
