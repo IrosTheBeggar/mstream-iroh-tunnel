@@ -36,6 +36,10 @@ c-abi = []
 os-trust = ["iroh/platform-verifier"]
 
 [dependencies]
+# Cargo.lock holds libc at 0.2.189 (`cargo update -p libc --precise 0.2.189`):
+# 0.2.190 gates `in6_ifreq` to macOS, and netdev (iroh's interface watcher, via
+# netwatch) still names it on iOS, so the iOS xcframework stops compiling on
+# anything newer. Lift the hold once netdev stops using it on iOS.
 # iroh CORE only — no iroh-blobs/docs/gossip/rpc (keeps the Android .so small).
 iroh = "1"
 iroh-tickets = "1"
