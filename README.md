@@ -61,7 +61,7 @@ moved here from `rust/iroh_tunnel` in the mobile app's repository on
 
 ```toml
 [dependencies]
-mstream-iroh-tunnel = { git = "https://github.com/IrosTheBeggar/mstream-iroh-tunnel", tag = "v0.2.0", default-features = false, features = ["os-trust"] }
+mstream-iroh-tunnel = { git = "https://github.com/IrosTheBeggar/mstream-iroh-tunnel", tag = "v0.2.1", default-features = false, features = ["os-trust"] }
 ```
 
 ```rust
@@ -187,3 +187,5 @@ The consumers' migration plan lives in the mobile app repo
   `Tunnel::local_url`, `mstream_iroh_version` (ABI stays 2), the `c-abi` and
   `os-trust` features, an offline end-to-end test against a fake server
   endpoint, and the tag-driven release workflow. See `CHANGELOG.md`.
+- **2026-10-30** — v0.2.1: a lockfile refresh to iroh 1.4.1 / rustls 0.23.46
+  that clears nine `cargo audit` advisories; no API or ABI change.
