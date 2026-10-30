@@ -13,6 +13,10 @@ A dependency refresh: the lockfile only, no API change (ABI stays 2).
   constant-time one in ctutils (-0385); and the tokio `AsyncFd` unsoundness
   warning (-0386). iroh 1.4 also updates its advertised addresses at once on
   a relay-less LAN change and sends the relay the `X-Iroh-Endpoint-Id` header.
+- `Cargo.lock` holds libc at 0.2.189: 0.2.190 gates `in6_ifreq` to macOS and
+  netdev (iroh’s interface watcher) still uses it on iOS, so a newer libc
+  breaks the iOS xcframework build (the first v0.2.1 release run). Lift the
+  hold once netdev stops naming it on iOS.
 - The release workflow also builds `iroh_tunnel-<tag>-linux-aarch64.zip`
   (on GitHub's arm64 Linux runner), for Raspberry Pis, Graviton hosts and
   Apple-silicon VMs.
